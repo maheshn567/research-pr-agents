@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import * as readline from 'readline';
 import { mastra } from './mastra/index.ts';
 import { postPRReviewTool } from './mastra/tools/postPRReviewTool.ts';
@@ -22,9 +23,6 @@ function askQuestion(query: string): Promise<string> {
   );
 }
 
-/**
- * Creates a clean, concise terminal preview snippet of the report
- */
 function getShortPreview(fullReport: string): string {
   const lines = fullReport.split('\n');
   const previewLines: string[] = [];
@@ -42,31 +40,17 @@ function getShortPreview(fullReport: string): string {
   return previewLines.join('\n');
 }
 
-async function reviseReport(previousReport: string): Promise<string> {
-  const feedback = await askQuestion('📝 What feedback or changes should be made to the PR review comment?\n> ');
-  console.log('\n⏳ Regenerating revised PR Review comment based on your feedback...');
-
-  const revisionPrompt = `The human reviewer rejected the previous PR review comment with the following feedback:
-  "${feedback}"
-
-  ### Previous PR Review Comment:
-  ${previousReport}
-
-  Please generate a revised, updated PR Review Report addressing all user feedback.`;
-
-  const revisionResponse = await prReviewerAgent.generateLegacy(revisionPrompt, { maxSteps: 3 });
-  return revisionResponse.text;
-}
-
-/**
- * Runs the PR review workflow, shows the report, and posts it to GitHub only after human approval.
- */
 export async function reviewWithApproval(prTarget: PRTarget): Promise<void> {
+  console.log('====================================================');
+  console.log('🐙 Automated GitHub PR Reviewer (Human Approval Loop)');
+  console.log('====================================================\n');
+
+  const workflow = mastra.getWorkflow('prReviewWorkflow');
+
   console.log(`📌 Target PR: https://github.com/${prTarget.owner}/${prTarget.repo}/pull/${prTarget.pullNumber}`);
 
   try {
-    // 1. Run PR Review Workflow
-    const run = await mastra.getWorkflow('prReviewWorkflow').createRun();
+    const run = await workflow.createRun();
     const result = await run.start({ inputData: prTarget });
 
     if (result.status !== 'success' || !result.result) {
@@ -75,45 +59,78 @@ export async function reviewWithApproval(prTarget: PRTarget): Promise<void> {
     }
 
     let currentReport = result.result.prReviewReport;
+    let approved = false;
 
-    // 2. Interactive Human-in-the-Loop Approval & Refinement Loop
-    while (true) {
+    while (!approved) {
       console.log('\n====================================================');
       console.log('📄 PROPOSED GITHUB PR REVIEW PREVIEW');
       console.log('====================================================\n');
       console.log(getShortPreview(currentReport));
       console.log('\n====================================================');
 
-      const answer = (await askQuestion('\n❓ Approve and post to GitHub? Options: (yes / no / view full comment): ')).toLowerCase();
+      const answer = await askQuestion('\n❓ Approve and post to GitHub? Options: (yes / no / view full comment): ');
+      const cleanAnswer = answer.toLowerCase().trim();
 
-      if (answer === 'view' || answer === 'v' || answer === 'full') {
+      if (cleanAnswer === 'view' || cleanAnswer === 'v' || cleanAnswer === 'full') {
         console.log('\n====================================================');
         console.log('📜 FULL PR REVIEW COMMENT (EXACT MARKDOWN TO BE POSTED)');
         console.log('====================================================\n');
         console.log(currentReport);
         console.log('\n====================================================');
+        
+        const confirmAnswer = await askQuestion('\n❓ Do you approve posting this full comment to GitHub now? (yes / no): ');
+        if (confirmAnswer.toLowerCase() === 'yes' || confirmAnswer.toLowerCase() === 'y') {
+          approved = true;
+        } else {
+          const feedback = await askQuestion('📝 What feedback or changes should be made to the PR review comment?\n> ');
+          console.log('\n⏳ Regenerating revised PR Review comment based on your feedback...');
+          const revisionPrompt = `The human reviewer rejected the previous PR review comment with the following feedback:
+          "${feedback}"
 
-        const confirm = (await askQuestion('\n❓ Do you approve posting this full comment to GitHub now? (yes / no): ')).toLowerCase();
-        if (confirm === 'yes' || confirm === 'y') break;
-        currentReport = await reviseReport(currentReport);
-      } else if (answer === 'yes' || answer === 'y') {
-        break;
+          ### Previous PR Review Comment:
+          ${currentReport}
+
+          Please generate a revised, updated PR Review Report addressing all user feedback.`;
+
+          const revisionResponse = await prReviewerAgent.generateLegacy(revisionPrompt, { maxSteps: 3 });
+          currentReport = revisionResponse.text;
+        }
+      } else if (cleanAnswer === 'yes' || cleanAnswer === 'y') {
+        approved = true;
       } else {
         console.log('\n✋ Review rejected by user.');
-        currentReport = await reviseReport(currentReport);
+        const feedback = await askQuestion('📝 What feedback or changes should be made to the PR review comment?\n> ');
+
+        console.log('\n⏳ Regenerating revised PR Review comment based on your feedback...');
+
+        const revisionPrompt = `The human reviewer rejected the previous PR review comment with the following feedback:
+        "${feedback}"
+
+        ### Previous PR Review Comment:
+        ${currentReport}
+
+        Please generate a revised, updated PR Review Report addressing all user feedback.`;
+
+        const revisionResponse = await prReviewerAgent.generateLegacy(revisionPrompt, { maxSteps: 3 });
+        currentReport = revisionResponse.text;
       }
-    }
 
-    console.log('\n🚀 Approval granted! Publishing review comment to GitHub...');
-    const postResult = await postPRReviewTool.execute({
-      ...prTarget,
-      reviewReport: currentReport,
-      event: 'COMMENT',
-    });
+      if (approved) {
+        console.log('\n🚀 Approval granted! Publishing review comment to GitHub...');
 
-    console.log(`\n🎉 ${postResult.message}`);
-    if (postResult.htmlUrl) {
-      console.log(`🔗 Review Link: ${postResult.htmlUrl}`);
+        const postResult = await postPRReviewTool.execute({
+          owner: prTarget.owner,
+          repo: prTarget.repo,
+          pullNumber: prTarget.pullNumber,
+          reviewReport: currentReport,
+          event: 'COMMENT',
+        });
+
+        console.log(`\n🎉 ${postResult.message}`);
+        if (postResult.htmlUrl) {
+          console.log(`🔗 Review Link: ${postResult.htmlUrl}`);
+        }
+      }
     }
   } catch (error) {
     console.error('❌ Error during PR Review loop:', error);
